@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: iceguard
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
