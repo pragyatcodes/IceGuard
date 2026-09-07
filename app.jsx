@@ -2,6 +2,13 @@
 const { useState, useEffect, useRef, useMemo } = React;
 
 const CARTO_DARK = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style.json";
+const OFFLINE_STYLE = { version: 8, name: "iceguard-offline", sources: {},
+  layers: [{ id: "bg", type: "background", paint: { "background-color": "#06101f" } }] };
+const OSM_STYLE = { version: 8, name: "osm", sources: { osm: { type: "raster",
+  tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"], tileSize: 256, maxzoom: 19,
+  attribution: "OpenStreetMap contributors" } },
+  layers: [{ id: "osm", type: "raster", source: "osm" }] };
+const BASES = { carto: CARTO_DARK, osm: OSM_STYLE, offline: OFFLINE_STYLE };
 const STATIONS = [
   { name: "Maitri", lat: -70.77, lon: 11.73 },
   { name: "Bharati", lat: -69.41, lon: 76.19 },
@@ -100,6 +107,8 @@ function App() {
   const [drawing, setDrawing] = useState(false);
   const [draft, setDraft] = useState(null);         // [[lat,lon],...] drawn corridor
   const [toast, setToast] = useState(null);
+  const [mapNote, setMapNote] = useState("");
+  const [base, setBase] = useState("carto");
   const [showOverride, setShowOverride] = useState(false);
   const [showFeeds, setShowFeeds] = useState(false);
   const [q, setQ] = useState("");
@@ -122,15 +131,8 @@ function App() {
   }
 
   /* ---------------- map init ---------------- */
-  useEffect(() => {
-    document.getElementById("boot").style.display = "none";
-    const map = new maplibregl.Map({
-      container: "map", style: CARTO_DARK, center: [35, -64], zoom: 2.3,
-      maxBounds: [[-180, -85], [180, 10]],
-    });
-    map.addControl(new maplibregl.NavigationControl({ visualizePitch: false }), "top-right");
-    map.on("load", () => {
-      const M = mapRef.current;
+  // Ops sources + layers. Runs once the (online or offline) style is ready.
+  function addOpsLayers(M) {
       M.addSource("ice", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
       M.addLayer({ id: "ice-heat", type: "heatmap", source: "ice", maxzoom: 12,
         paint: {
@@ -175,16 +177,59 @@ function App() {
         filter: ["==", ["geometry-type"], "Point"],
         layout: { "text-field": ["get", "seq"], "text-size": 10, "text-offset": [0, -1.4] },
         paint: { "text-color": "#fed7aa", "text-halo-color": "#431407", "text-halo-width": 1.5 } });
-      map.on("click", (e) => {
+      M.on("click", (e) => {
         if (drawingRef.current) {
           const la = +e.lngLat.lat.toFixed(4), lo = +e.lngLat.lng.toFixed(4);
           setDraft((prev) => [...(prev || []), [la, lo]]);
         }
       });
-      setMapReady(true);
-    });
-    mapRef.current = map;
-    return () => { try { map.remove(); } catch (e) {} };
+  }
+  useEffect(() => {
+    document.getElementById("boot").style.display = "none";
+    let cancelled = false;
+    // Reachability pre-check: if the base-map style is unreachable (offline/slow/blocked),
+    // boot with an offline style. Our ops layers (ice, tracks, cones) need no base tiles.
+    fetch(CARTO_DARK, { mode: "cors" }).then(
+      (r) => { if (!cancelled) bootMap(r.ok ? CARTO_DARK : OFFLINE_STYLE, !r.ok); },
+      () => { if (!cancelled) bootMap(OFFLINE_STYLE, true); }
+    );
+    const bootTimer = setTimeout(() => {
+      if (!cancelled && !mapRef.current) bootMap(OFFLINE_STYLE, true);
+    }, 10000);
+    function bootMap(style, offline) {
+      if (cancelled || mapRef.current) return;
+      if (offline) setMapNote("offline base map - ops layers active");
+      setBase(offline ? "offline" : "carto");
+      const map = new maplibregl.Map({
+        container: "map", style: style, center: [35, -64], zoom: 2.3,
+        maxBounds: [[-180, -85], [180, 10]],
+      });
+      mapRef.current = map;
+      map.addControl(new maplibregl.NavigationControl({ visualizePitch: false }), "top-right");
+      const haveLayers = () => { try { return !!mapRef.current.getSource("ice"); } catch (e) { return false; } };
+      const initLayers = () => {
+        if (!mapRef.current || haveLayers()) return;
+        try {
+          addOpsLayers(mapRef.current);
+          setMapReady(true);
+        } catch (e) { /* style not ready yet - load event retries */ }
+      };
+      map.on("load", initLayers);
+      map.on("error", () => {
+        try { if (!map.isStyleLoaded()) setMapNote("base map unreachable - ops layers active"); } catch (e) {}
+      });
+      setTimeout(() => {
+        if (cancelled || haveLayers()) return;
+        try { map.setStyle(OFFLINE_STYLE); } catch (e) {}
+        setMapNote("offline base map - ops layers active");
+        setBase("offline");
+        setTimeout(initLayers, 1500);
+        setTimeout(initLayers, 4000);
+      }, 12000);
+    }
+    return () => { cancelled = true; clearTimeout(bootTimer);
+      try { mapRef.current && mapRef.current.remove(); } catch (e) {}
+      mapRef.current = null; };
   }, []);
 
   /* ---------------- data load ---------------- */
@@ -211,7 +256,7 @@ function App() {
       if (isAdmin) { try { setUsers((await api("/api/users")).users); } catch (e) {} }
     } catch (e) { fail(e); }
   }
-  useEffect(() => { if (authed && mapReady) loadAll(); }, [authed, mapReady]);
+  useEffect(() => { if (authed) loadAll(); }, [authed]);
 
   useEffect(() => { drawingRef.current = drawing;
     const M = mapRef.current;
@@ -292,6 +337,26 @@ function App() {
     setDraft(null); setDrawing(false);
     if (voyages.length) selectVoyage(voyages[0].code, voyages);
     else { setSelVoyage(null); setAdvice(null); }
+  }
+  function switchBase(name) {
+    setBase(name);
+    const M = mapRef.current;
+    if (!M) { setMapNote(""); return; }
+    setMapNote(name === "offline" ? "offline base map - ops layers active" : "");
+    try { M.setStyle(BASES[name]); } catch (e) {}
+    // setStyle wipes custom layers: re-add once the new style is ready
+    let n = 0;
+    const iv = setInterval(() => {
+      n++;
+      const fail = () => { clearInterval(iv); setMapNote(name + " base map unreachable - try OSM or offline"); };
+      try {
+        if (M.getSource("ice")) { clearInterval(iv); return; }
+        if (M.isStyleLoaded()) {
+          try { addOpsLayers(M); setMapReady(true); } catch (e) {}
+          clearInterval(iv);
+        } else if (n > 30) fail();
+      } catch (e) { if (n > 30) fail(); }
+    }, 350);
   }
 
   /* ---------------- map render ---------------- */
@@ -509,7 +574,7 @@ function App() {
             ))}
           </div>
           <div className="section-title">Voyages & corridors</div>
-          <button className="btn small primary" style={{ margin: "0 10px 8px" }} onClick={startDraw}>\u270F Draw new voyage</button>
+          <button className="btn small primary" style={{ margin: "0 10px 8px" }} onClick={startDraw}>✏ Draw new voyage</button>
           <div className="voy-list" style={{ maxHeight: "30%" }}>
             {voyages.map((v) => (
               <div key={v.code} className={"voy-item" + (selVoyage && selVoyage.code === v.code ? " sel" : "")}
@@ -549,18 +614,24 @@ function App() {
           {degraded && <div className="degraded-banner">⚠ DEGRADED — SAR older than limit. Advice capped at SLOW. Advice refreshes on next STAC ingest.</div>}
           {drawing && (
             <div className="draw-bar">
-              <span>\uD83D\uDCCC {(draft || []).length} wp - click map to add</span>
-              <button className="btn small ghost" onClick={undoDraft}>\u21A9 Undo</button>
-              <button className="btn small primary" onClick={finishDraft}>\u2713 Done - score it</button>
-              <button className="btn small danger" onClick={cancelDraw}>\u2715</button>
+              <span>📌 {(draft || []).length} wp - click map to add</span>
+              <button className="btn small ghost" onClick={undoDraft}>↩ Undo</button>
+              <button className="btn small primary" onClick={finishDraft}>✓ Done - score it</button>
+              <button className="btn small danger" onClick={cancelDraw}>✕</button>
             </div>
           )}
+          {mapNote && <div className="map-note">{"\u26a0 " + mapNote}</div>}
           {lite && <div className="lite-banner">📡 LITE station mode · bundle ≈ {skill ? skill.payload_kb : "—"} KB · tracks + cones + badge only</div>}
           <div className="map-legend">
             <div><span className="sw" style={{ background: "linear-gradient(90deg,#0c4a6e,#7dd3fc,#f0f9ff)" }}></span>Ice concentration (AMSR2/NSIDC)</div>
             <div><span className="sw" style={{ background: "#22d3ee" }}></span>Forecast track (physics + AI residual)</div>
             <div><span className="sw" style={{ background: "#22d3ee55", border: "1px solid #22d3ee" }}></span>90% cone (advice uses the cone)</div>
             <div><span className="sw" style={{ background: "#94a3b8" }}></span>History (replay the week)</div>
+            <div style={{ marginTop: 6 }}>Base map: <select value={base} onChange={(e) => switchBase(e.target.value)} style={{ background: "#081426", color: "#dbe7f5", border: "1px solid #1c2f4d", borderRadius: 4, fontSize: 11, marginLeft: 4 }}>
+              <option value="carto">Carto dark</option>
+              <option value="osm">OpenStreetMap</option>
+              <option value="offline">Offline (no tiles)</option>
+            </select></div>
           </div>
           <div className="disclaimer">Decision support only — not a substitute for master/pilot judgement or official ice charts. No helm commands. Overrides are logged.</div>
         </div>
@@ -775,7 +846,7 @@ function DraftSaveForm(p) {
         onChange={(e) => setCode(e.target.value.toUpperCase().replace(/[^A-Z0-9-]/g, ""))} />
       <input className="txt" placeholder="Title (optional)" value={title} onChange={(e) => setTitle(e.target.value)} />
       <button className="btn small primary" style={{ width: "100%" }} disabled={!code.trim()}
-        onClick={() => p.onSave(code, title)}>\uD83D\uDCBE Save voyage</button>
+        onClick={() => p.onSave(code, title)}>💾 Save voyage</button>
     </div>
   );
 }
@@ -790,7 +861,7 @@ function RouteTab(p) {
         {p.voyages.map((v) => <option key={v.code} value={v.code}>{v.code} — {v.title}</option>)}
       </select>
       <div className="row2">
-        <button className="btn small" onClick={p.onDraw}>\u270F Draw new</button>
+        <button className="btn small" onClick={p.onDraw}>✏ Draw new</button>
         {p.isDraft
           ? <button className="btn small ghost" onClick={p.onDiscard}>✕ Discard</button>
           : <button className="btn small ghost" onClick={() => p.voyage && p.onSelect(p.voyage.code)}>↻ Re-score</button>}
