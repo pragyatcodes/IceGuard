@@ -1,7 +1,7 @@
 /* ICEGUARD ops console — React + MapLibre. Physics first, SAR first, cone first, human first. */
 const { useState, useEffect, useRef, useMemo } = React;
 
-const CARTO_DARK = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style.json";
+const CARTO_DARK = "https://tiles.openfreemap.org/styles/liberty";
 const STATIONS = [
   { name: "Maitri", lat: -70.77, lon: 11.73 },
   { name: "Bharati", lat: -69.41, lon: 76.19 },
